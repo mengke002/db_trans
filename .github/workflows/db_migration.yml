@@ -1,4 +1,4 @@
-name: Migrate to TiDB (Fixed)
+name: Migrate to TiDB
 
 on:
   workflow_dispatch:
