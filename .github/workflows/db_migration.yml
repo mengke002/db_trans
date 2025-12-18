@@ -1,10 +1,10 @@
-name: MySQL Cloud Migration
+name: MySQL One-Click Migration
 
 on:
-  workflow_dispatch:  # 允许手动点击按钮触发
+  workflow_dispatch: # 手动触发
 
 jobs:
-  migrate-database:
+  migrate:
     runs-on: ubuntu-latest
     steps:
       - name: Install MySQL Client
@@ -12,42 +12,74 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mysql-client
 
-      - name: Check Connection (Optional)
+      - name: Migrate Data using Python
+        env:
+          OLD_URI: ${{ secrets.OLD_DB_URI }}
+          NEW_URI: ${{ secrets.NEW_DB_URI }}
         run: |
-          echo "Testing connection to OLD database..."
-          mysql -h ${{ secrets.OLD_HOST }} -P ${{ secrets.OLD_PORT }} -u ${{ secrets.OLD_USER }} -p"${{ secrets.OLD_PASSWORD }}" --ssl-mode=REQUIRED -e "SELECT 1;"
-          echo "Connection OK."
+          python3 -c "
+          import os, subprocess, sys
+          from urllib.parse import urlparse
 
-      - name: Dump Data from OLD Database
-        run: |
-          echo "Starting export from OLD database..."
-          # 使用 --set-gtid-purged=OFF 避免权限错误
-          # 使用 --hex-blob 防止乱码
-          mysqldump -h ${{ secrets.OLD_HOST }} \
-            -P ${{ secrets.OLD_PORT }} \
-            -u ${{ secrets.OLD_USER }} \
-            -p"${{ secrets.OLD_PASSWORD }}" \
-            --ssl-mode=REQUIRED \
-            --single-transaction \
-            --quick \
-            --hex-blob \
-            --set-gtid-purged=OFF \
-            ${{ secrets.DB_NAME }} > dump.sql
-          
-          echo "Export finished. File size:"
-          ls -lh dump.sql
+          def run_migration():
+              print('>>> 解析 Service URI...')
+              # 1. 解析旧数据库 URI
+              old = urlparse(os.environ['OLD_URI'])
+              old_pass = old.password
+              # 如果密码中有特殊字符需要处理，但 urlparse 通常能处理好
+              
+              # 2. 解析新数据库 URI
+              new = urlparse(os.environ['NEW_URI'])
+              new_pass = new.password
 
-      - name: Import Data to NEW Database
-        run: |
-          echo "Starting import to NEW database..."
-          mysql -h ${{ secrets.NEW_HOST }} \
-            -P ${{ secrets.NEW_PORT }} \
-            -u ${{ secrets.NEW_USER }} \
-            -p"${{ secrets.NEW_PASSWORD }}" \
-            --ssl-mode=REQUIRED \
-            ${{ secrets.DB_NAME }} < dump.sql
-            
-          echo "Import finished successfully!"
+              print('>>> 开始从旧库导出数据 (Exporting)...')
+              # 构建导出命令
+              # 注意: p.path 通常是 '/defaultdb'，我们需要去掉斜杠
+              dump_cmd = [
+                  'mysqldump',
+                  '-h', old.hostname,
+                  '-P', str(old.port),
+                  '-u', old.username,
+                  f'-p{old_pass}',  # 密码紧跟-p
+                  '--ssl-mode=REQUIRED',
+                  '--single-transaction',
+                  '--quick',
+                  '--hex-blob',
+                  '--set-gtid-purged=OFF',
+                  old.path.lstrip('/') # 数据库名
+              ]
+              
+              # 执行导出，写入 dump.sql
+              with open('dump.sql', 'w') as f:
+                  subprocess.run(dump_cmd, stdout=f, check=True)
+              
+              print(f'>>> 导出完成! 文件大小: {os.path.getsize('dump.sql') / 1024 / 1024:.2f} MB')
+
+              print('>>> 开始导入到新库 (Importing)...')
+              # 构建导入命令
+              import_cmd = [
+                  'mysql',
+                  '-h', new.hostname,
+                  '-P', str(new.port),
+                  '-u', new.username,
+                  f'-p{new_pass}',
+                  '--ssl-mode=REQUIRED',
+                  new.path.lstrip('/') # 数据库名
+              ]
+
+              # 执行导入，读取 dump.sql
+              with open('dump.sql', 'r') as f:
+                  subprocess.run(import_cmd, stdin=f, check=True)
+                  
+              print('>>> ✅ 迁移成功完成！')
+
+          if __name__ == '__main__':
+              try:
+                  run_migration()
+              except Exception as e:
+                  print(f'❌ 错误: {e}')
+                  sys.exit(1)
+          "
 
       - name: Clean up
         if: always()
