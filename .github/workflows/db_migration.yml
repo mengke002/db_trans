@@ -17,25 +17,25 @@ jobs:
           OLD_URI: ${{ secrets.OLD_DB_URI }}
           NEW_URI: ${{ secrets.NEW_DB_URI }}
         run: |
-          python3 -c "
+          # 1. 把 Python 代码写入到一个文件里 (migrate.py)
+          # 使用 'EOF' 可以防止 Shell 乱改里面的代码字符
+          cat << 'EOF' > migrate.py
           import os, subprocess, sys
           from urllib.parse import urlparse
 
           def run_migration():
               print('>>> 正在解析连接信息...')
-              # 解析旧库 (Aiven)
               old = urlparse(os.environ['OLD_URI'])
-              
-              # 解析新库 (TiDB)
               new = urlparse(os.environ['NEW_URI'])
-              # 注意: TiDB 的 URI 中数据库名通常是 /test，会自动导入到那里
+              
+              # 清理数据库名前面的斜杠
+              old_db = old.path.lstrip('/')
               target_db = new.path.lstrip('/')
 
-              print(f'>>> 源数据库: {old.hostname} ({old.path.lstrip("/")})')
+              print(f'>>> 源数据库: {old.hostname} ({old_db})')
               print(f'>>> 目标数据库: {new.hostname} ({target_db})')
 
               print('\n>>> [1/2] 正在从旧库导出数据...')
-              # 简单的整库导出
               dump_cmd = [
                   'mysqldump',
                   '-h', old.hostname,
@@ -46,8 +46,8 @@ jobs:
                   '--single-transaction',
                   '--quick',
                   '--hex-blob',
-                  '--set-gtid-purged=OFF', # TiDB 必须加这个
-                  old.path.lstrip('/')
+                  '--set-gtid-purged=OFF',
+                  old_db
               ]
               
               with open('dump.sql', 'w') as f:
@@ -57,7 +57,6 @@ jobs:
               print(f'>>> 导出完成! 文件大小: {size_mb:.2f} MB')
 
               print('\n>>> [2/2] 正在导入到 TiDB...')
-              # 简单的整库导入
               import_cmd = [
                   'mysql',
                   '-h', new.hostname,
@@ -79,4 +78,7 @@ jobs:
               except Exception as e:
                   print(f'❌ 错误: {e}')
                   sys.exit(1)
-          "
+          EOF
+
+          # 2. 运行这个 Python 文件
+          python3 migrate.py
