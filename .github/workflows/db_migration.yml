@@ -1,4 +1,4 @@
-name: MySQL Stable Migration
+name: Migrate to TiDB
 
 on:
   workflow_dispatch:
@@ -12,101 +12,71 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mysql-client
 
-      - name: Stable Migrate using Python
+      - name: Simple Migrate using Python
         env:
           OLD_URI: ${{ secrets.OLD_DB_URI }}
           NEW_URI: ${{ secrets.NEW_DB_URI }}
         run: |
           python3 -c "
-          import os, subprocess, sys, time
+          import os, subprocess, sys
           from urllib.parse import urlparse
 
-          def get_connection_args(uri_str):
-              u = urlparse(uri_str)
-              return {
-                  'host': u.hostname,
-                  'port': str(u.port),
-                  'user': u.username,
-                  'password': u.password,
-                  'db': u.path.lstrip('/')
-              }
-
-          def run_command(cmd, stdin_file=None):
-              try:
-                  if stdin_file:
-                      with open(stdin_file, 'r') as f:
-                          subprocess.run(cmd, stdin=f, check=True, text=True, capture_output=True)
-                  else:
-                      subprocess.run(cmd, check=True, text=True, capture_output=True)
-              except subprocess.CalledProcessError as e:
-                  print(f'❌ 命令执行失败: {e}')
-                  if e.stderr: print(f'错误详情: {e.stderr}')
-                  raise
-
-          def migrate():
-              old = get_connection_args(os.environ['OLD_URI'])
-              new = get_connection_args(os.environ['NEW_URI'])
+          def run_migration():
+              print('>>> 正在解析连接信息...')
+              # 解析旧库 (Aiven)
+              old = urlparse(os.environ['OLD_URI'])
               
-              print('>>> [1/4] 连接旧数据库，获取表清单...')
-              list_cmd = [
-                  'mysql', '-h', old['host'], '-P', old['port'], '-u', old['user'], f'-p{old['password']}',
-                  '--ssl-mode=REQUIRED', '-N', '-e', 'SHOW TABLES', old['db']
-              ]
-              # 获取表名列表
-              try:
-                  output = subprocess.run(list_cmd, check=True, text=True, capture_output=True).stdout
-                  tables = [t.strip() for t in output.splitlines() if t.strip()]
-              except Exception as e:
-                  print(f'连接失败，请检查 Secret 配置。详情: {e}')
-                  sys.exit(1)
-                  
-              print(f'>>> 发现 {len(tables)} 张表: {tables}')
+              # 解析新库 (TiDB)
+              new = urlparse(os.environ['NEW_URI'])
+              # 注意: TiDB 的 URI 中数据库名通常是 /test，会自动导入到那里
+              target_db = new.path.lstrip('/')
 
-              print('\n>>> [2/4] 迁移表结构 (Schema Only)...')
-              dump_schema = [
-                  'mysqldump', '-h', old['host'], '-P', old['port'], '-u', old['user'], f'-p{old['password']}',
-                  '--ssl-mode=REQUIRED', '--single-transaction', '--no-data', '--set-gtid-purged=OFF',
-                  old['db']
+              print(f'>>> 源数据库: {old.hostname} ({old.path.lstrip("/")})')
+              print(f'>>> 目标数据库: {new.hostname} ({target_db})')
+
+              print('\n>>> [1/2] 正在从旧库导出数据...')
+              # 简单的整库导出
+              dump_cmd = [
+                  'mysqldump',
+                  '-h', old.hostname,
+                  '-P', str(old.port),
+                  '-u', old.username,
+                  f'-p{old.password}',
+                  '--ssl-mode=REQUIRED',
+                  '--single-transaction',
+                  '--quick',
+                  '--hex-blob',
+                  '--set-gtid-purged=OFF', # TiDB 必须加这个
+                  old.path.lstrip('/')
               ]
-              with open('schema.sql', 'w') as f:
-                  subprocess.run(dump_schema, stdout=f, check=True)
               
-              import_base = [
-                  'mysql', '-h', new['host'], '-P', new['port'], '-u', new['user'], f'-p{new['password']}',
-                  '--ssl-mode=REQUIRED', new['db']
+              with open('dump.sql', 'w') as f:
+                  subprocess.run(dump_cmd, stdout=f, check=True)
+              
+              size_mb = os.path.getsize('dump.sql') / 1024 / 1024
+              print(f'>>> 导出完成! 文件大小: {size_mb:.2f} MB')
+
+              print('\n>>> [2/2] 正在导入到 TiDB...')
+              # 简单的整库导入
+              import_cmd = [
+                  'mysql',
+                  '-h', new.hostname,
+                  '-P', str(new.port),
+                  '-u', new.username,
+                  f'-p{new.password}',
+                  '--ssl-mode=REQUIRED',
+                  target_db
               ]
-              run_command(import_base, stdin_file='schema.sql')
-              print('✅ 表结构创建完成')
 
-              print('\n>>> [3/4] 逐表迁移数据 (Stable Mode)...')
-              for i, table in enumerate(tables):
-                  print(f'>>> [{i+1}/{len(tables)}] 正在迁移表: {table} ...')
+              with open('dump.sql', 'r') as f:
+                  subprocess.run(import_cmd, stdin=f, check=True)
                   
-                  with open('table_data.sql', 'w') as f:
-                      # 仅保留安全的优化指令，去掉导致报错的 SQL_LOG_BIN
-                      f.write('SET FOREIGN_KEY_CHECKS=0;\n')
-                      f.write('SET AUTOCOMMIT=0;\n') 
-                      f.flush()
-                      
-                      dump_table = [
-                          'mysqldump', '-h', old['host'], '-P', old['port'], '-u', old['user'], f'-p{old['password']}',
-                          '--ssl-mode=REQUIRED', '--single-transaction', '--hex-blob', '--no-create-info', 
-                          '--set-gtid-purged=OFF', old['db'], table
-                      ]
-                      subprocess.run(dump_table, stdout=f, check=True)
-                      
-                      f.write('\nCOMMIT;\n')
-                      f.flush()
-
-                  # 导入
-                  run_command(import_base, stdin_file='table_data.sql')
-                  
-                  os.remove('table_data.sql')
-                  # 休息3秒，让 Aiven 有机会清理 Binlog
-                  time.sleep(3)
-
-              print('\n>>> [4/4] ✅ 全部迁移成功！')
+              print('\n>>> 🎉 恭喜！数据已成功迁移到 TiDB！')
 
           if __name__ == '__main__':
-              migrate()
+              try:
+                  run_migration()
+              except Exception as e:
+                  print(f'❌ 错误: {e}')
+                  sys.exit(1)
           "
