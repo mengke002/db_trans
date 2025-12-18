@@ -1,4 +1,4 @@
-name: MySQL Final Migration
+name: MySQL Stable Migration
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mysql-client
 
-      - name: Ultimate Migrate using Python
+      - name: Stable Migrate using Python
         env:
           OLD_URI: ${{ secrets.OLD_DB_URI }}
           NEW_URI: ${{ secrets.NEW_DB_URI }}
@@ -31,14 +31,13 @@ jobs:
                   'db': u.path.lstrip('/')
               }
 
-          def run_command(cmd, stdin_file=None, capture_output=True):
+          def run_command(cmd, stdin_file=None):
               try:
                   if stdin_file:
                       with open(stdin_file, 'r') as f:
-                          result = subprocess.run(cmd, stdin=f, check=True, text=True, capture_output=capture_output)
+                          subprocess.run(cmd, stdin=f, check=True, text=True, capture_output=True)
                   else:
-                      result = subprocess.run(cmd, check=True, text=True, capture_output=capture_output)
-                  return result.stdout
+                      subprocess.run(cmd, check=True, text=True, capture_output=True)
               except subprocess.CalledProcessError as e:
                   print(f'❌ 命令执行失败: {e}')
                   if e.stderr: print(f'错误详情: {e.stderr}')
@@ -48,74 +47,66 @@ jobs:
               old = get_connection_args(os.environ['OLD_URI'])
               new = get_connection_args(os.environ['NEW_URI'])
               
-              print('>>> [1/5] 连接旧数据库，获取表清单...')
-              list_tables_cmd = [
+              print('>>> [1/4] 连接旧数据库，获取表清单...')
+              list_cmd = [
                   'mysql', '-h', old['host'], '-P', old['port'], '-u', old['user'], f'-p{old['password']}',
                   '--ssl-mode=REQUIRED', '-N', '-e', 'SHOW TABLES', old['db']
               ]
-              tables = [t.strip() for t in run_command(list_tables_cmd).splitlines() if t.strip()]
-              print(f'>>> 发现 {len(tables)} 张表')
+              # 获取表名列表
+              try:
+                  output = subprocess.run(list_cmd, check=True, text=True, capture_output=True).stdout
+                  tables = [t.strip() for t in output.splitlines() if t.strip()]
+              except Exception as e:
+                  print(f'连接失败，请检查 Secret 配置。详情: {e}')
+                  sys.exit(1)
+                  
+              print(f'>>> 发现 {len(tables)} 张表: {tables}')
 
-              print('\n>>> [2/5] 尝试在新库建立“无日志”连接...')
-              # 这里的技巧是：在导入 SQL 文件的头部加上 SET SQL_LOG_BIN=0
-              # 如果 Aiven 允许，这将彻底解决空间问题。如果不允许，脚本会忽略错误继续运行。
-              disable_log_header = 'SET SQL_LOG_BIN=0;\n'
-              
-              print('\n>>> [3/5] 迁移表结构 (Schema)...')
-              dump_schema_cmd = [
+              print('\n>>> [2/4] 迁移表结构 (Schema Only)...')
+              dump_schema = [
                   'mysqldump', '-h', old['host'], '-P', old['port'], '-u', old['user'], f'-p{old['password']}',
                   '--ssl-mode=REQUIRED', '--single-transaction', '--no-data', '--set-gtid-purged=OFF',
                   old['db']
               ]
               with open('schema.sql', 'w') as f:
-                  subprocess.run(dump_schema_cmd, stdout=f, check=True)
+                  subprocess.run(dump_schema, stdout=f, check=True)
               
-              # 导入结构
               import_base = [
                   'mysql', '-h', new['host'], '-P', new['port'], '-u', new['user'], f'-p{new['password']}',
                   '--ssl-mode=REQUIRED', new['db']
               ]
-              run_command(import_base, stdin_file='schema.sql', capture_output=False)
+              run_command(import_base, stdin_file='schema.sql')
+              print('✅ 表结构创建完成')
 
-              print('\n>>> [4/5] 逐表迁移数据...')
+              print('\n>>> [3/4] 逐表迁移数据 (Stable Mode)...')
               for i, table in enumerate(tables):
-                  print(f'>>> [{i+1}/{len(tables)}] 正在迁移: {table} ...')
+                  print(f'>>> [{i+1}/{len(tables)}] 正在迁移表: {table} ...')
                   
                   with open('table_data.sql', 'w') as f:
-                      # 尝试写入关闭日志的指令
-                      f.write('/*!80000 SET SESSION SQL_LOG_BIN=0 */;\n') 
+                      # 仅保留安全的优化指令，去掉导致报错的 SQL_LOG_BIN
                       f.write('SET FOREIGN_KEY_CHECKS=0;\n')
-                      f.write('SET AUTOCOMMIT=0;\n') # 关闭自动提交，减少 IO
+                      f.write('SET AUTOCOMMIT=0;\n') 
                       f.flush()
                       
-                      dump_table_cmd = [
+                      dump_table = [
                           'mysqldump', '-h', old['host'], '-P', old['port'], '-u', old['user'], f'-p{old['password']}',
                           '--ssl-mode=REQUIRED', '--single-transaction', '--hex-blob', '--no-create-info', 
                           '--set-gtid-purged=OFF', old['db'], table
                       ]
-                      subprocess.run(dump_table_cmd, stdout=f, check=True)
+                      subprocess.run(dump_table, stdout=f, check=True)
                       
-                      f.write('\nCOMMIT;\n') # 最后手动提交
+                      f.write('\nCOMMIT;\n')
                       f.flush()
 
                   # 导入
-                  try:
-                      run_command(import_base, stdin_file='table_data.sql', capture_output=False)
-                  except:
-                      print('⚠️ 警告: 导入可能遇到问题，正在重试（不带 SQL_LOG_BIN 优化）...')
-                      # 如果因为权限报错，去掉优化指令再试一次
-                      # 这里只是为了容错，通常 mysqldump 产生的文件本身是标准的
-                      pass
+                  run_command(import_base, stdin_file='table_data.sql')
                   
                   os.remove('table_data.sql')
-                  time.sleep(1) # 喘息时间
+                  # 休息3秒，让 Aiven 有机会清理 Binlog
+                  time.sleep(3)
 
-              print('\n>>> [5/5] ✅ 迁移完成！')
+              print('\n>>> [4/4] ✅ 全部迁移成功！')
 
           if __name__ == '__main__':
-              try:
-                  migrate()
-              except Exception as e:
-                  print(f'\n❌ 迁移中断: {e}')
-                  sys.exit(1)
+              migrate()
           "
