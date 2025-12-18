@@ -1,0 +1,54 @@
+name: MySQL Cloud Migration
+
+on:
+  workflow_dispatch:  # 允许手动点击按钮触发
+
+jobs:
+  migrate-database:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install MySQL Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+
+      - name: Check Connection (Optional)
+        run: |
+          echo "Testing connection to OLD database..."
+          mysql -h ${{ secrets.OLD_HOST }} -P ${{ secrets.OLD_PORT }} -u ${{ secrets.OLD_USER }} -p"${{ secrets.OLD_PASSWORD }}" --ssl-mode=REQUIRED -e "SELECT 1;"
+          echo "Connection OK."
+
+      - name: Dump Data from OLD Database
+        run: |
+          echo "Starting export from OLD database..."
+          # 使用 --set-gtid-purged=OFF 避免权限错误
+          # 使用 --hex-blob 防止乱码
+          mysqldump -h ${{ secrets.OLD_HOST }} \
+            -P ${{ secrets.OLD_PORT }} \
+            -u ${{ secrets.OLD_USER }} \
+            -p"${{ secrets.OLD_PASSWORD }}" \
+            --ssl-mode=REQUIRED \
+            --single-transaction \
+            --quick \
+            --hex-blob \
+            --set-gtid-purged=OFF \
+            ${{ secrets.DB_NAME }} > dump.sql
+          
+          echo "Export finished. File size:"
+          ls -lh dump.sql
+
+      - name: Import Data to NEW Database
+        run: |
+          echo "Starting import to NEW database..."
+          mysql -h ${{ secrets.NEW_HOST }} \
+            -P ${{ secrets.NEW_PORT }} \
+            -u ${{ secrets.NEW_USER }} \
+            -p"${{ secrets.NEW_PASSWORD }}" \
+            --ssl-mode=REQUIRED \
+            ${{ secrets.DB_NAME }} < dump.sql
+            
+          echo "Import finished successfully!"
+
+      - name: Clean up
+        if: always()
+        run: rm -f dump.sql
